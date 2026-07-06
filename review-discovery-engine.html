@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>AI Review Discovery Engine — Spotify Growth</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; background:#fff; color:#1a1a2e; max-width:900px; margin:0 auto; padding:28px 20px 60px; }
+  .eyebrow { font-size:13px; font-weight:700; color:#7c3aed; letter-spacing:1px; text-transform:uppercase; }
+  h1 { font-size:26px; margin:6px 0 10px; }
+  p.intro { color:#555; line-height:1.55; font-size:15px; }
+  .card { border:1px solid #e5e7eb; border-radius:12px; padding:16px; background:#fafafa; margin-bottom:12px; }
+  .src { font-size:11px; font-weight:700; color:#888; text-transform:uppercase; margin-bottom:4px; }
+  .txt { font-size:14.5px; line-height:1.5; color:#222; margin-bottom:10px;}
+  button.analyze { background:#1a1a2e; color:#fff; border:none; border-radius:8px; padding:8px 14px; font-size:13px; font-weight:600; cursor:pointer; }
+  button.analyze:disabled { opacity:0.6; cursor:default; }
+  .badge { display:inline-block; padding:3px 10px; border-radius:999px; font-size:12px; font-weight:600; margin:0 6px 6px 0; }
+  .result { margin-top:10px; padding-top:10px; border-top:1px dashed #ddd; font-size:13.5px; color:#333; display:none; }
+  .result.show { display:block; }
+  .row { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }
+  .panel { background:#f3f0ff; border:1px solid #ddd6fe; border-radius:12px; padding:20px; margin-top:24px; }
+  textarea { width:100%; min-height:80px; border-radius:8px; border:1px solid #c4b5fd; padding:12px; font-size:14px; font-family:inherit; resize:vertical; }
+  .footer-note { margin-top:24px; font-size:12.5px; color:#888; line-height:1.6; }
+  .err { background:#fee2e2; color:#991b1b; padding:10px 14px; border-radius:8px; margin-bottom:16px; font-size:14px; display:none; }
+</style>
+</head>
+<body>
+
+<div class="eyebrow">Growth Team · Review Discovery Engine</div>
+<h1>AI-Powered Review &amp; Discussion Analyzer</h1>
+<p class="intro">This is a live, working slice of the full pipeline described in the deck. In production this stage ingests App&nbsp;Store, Play&nbsp;Store, Reddit and community-forum feedback at scale via APIs, then runs every item through this same Claude-powered classification step before landing themes in a queryable dashboard. Below are 10 real, publicly posted pieces of feedback (paraphrased) about music discovery — click <b>Analyze</b> to run the live model, or paste your own feedback at the bottom.</p>
+
+<div id="err" class="err"></div>
+<div id="cards"></div>
+
+<div class="panel">
+  <h3 style="margin:0 0 10px; font-size:16px; color:#4c1d95;">Try it with your own review or comment</h3>
+  <textarea id="customText" placeholder="Paste any App Store / Play Store / Reddit review about music discovery here…"></textarea>
+  <div><button class="analyze" id="customBtn" style="margin-top:10px; background:#7c3aed;">Analyze with Claude</button></div>
+  <div id="customResult" class="result"></div>
+</div>
+
+<div class="footer-note"><b>How this scales in production:</b> App Store/Play Store review APIs + Reddit API (PRAW) + social listening feeds run on a daily cron → normalized into a single schema → each item classified exactly as above by Claude → embeddings stored in a vector DB → a RAG chat layer lets any PM ask questions like "what causes users to repeatedly listen to the same content?" in plain English and get a synthesized, cited answer across thousands of reviews instead of reading them one by one.</div>
+
+<script>
+const SAMPLE_REVIEWS = [
+  { source: "Spotify Community", text: "Discover Weekly used to feel like true discovery, with a mix of songs across different genres. Lately it's more focused on music similar to what I already listen to. If I want similar music I can already use song radio or autoplay." },
+  { source: "Spotify Community", text: "Recommendations always play the same songs over and over again. We're stuck in an echo chamber. I'm paying for Premium but I'll be quitting soon." },
+  { source: "Reddit r/spotify", text: "It's stuck recommending 3 genres I'm not even into. Same three genres week after week. Feels buggy AND narrow AND wrong." },
+  { source: "App Store review", text: "I've had this app for 6 years and it just keeps giving me the same 60 songs. My library has thousands of saved tracks it never touches." },
+  { source: "Reddit r/musicsuggestions", text: "Even when I remove a song from an artist it comes back next reshuffle, even though the popup says it'll stop recommending that artist." },
+  { source: "Play Store review", text: "I want music that's very different from my usual genres sometimes. Discovery should be something new and exciting, not more of the same thing dressed up." },
+  { source: "Spotify Community", text: "In-playlist recommendations are dumb - just songs from the same artist or same country. How about actually recommending something interesting based on the vibe of the playlist instead?" },
+  { source: "Twitter / X", text: "me: listens to one anime opening once. spotify: ok so your entire personality is anime music now forever" },
+  { source: "App Store review", text: "New user here, only been on the app 2 months. Recommendations are honestly great and introduced me to 3 artists I now love. No complaints yet." },
+  { source: "Reddit r/spotify", text: "I follow 40 music blogs and curators outside the app because I don't trust the algorithm to show me anything I haven't already trained it to show me." },
+];
+
+const THEME_COLORS = {
+  "Filter bubble / narrow taste loop": "#7c3aed",
+  "Repetition fatigue": "#dc2626",
+  "Lack of user control": "#0891b2",
+  "Poor cross-genre discovery": "#d97706",
+  "Positive - new user onboarding": "#16a34a",
+  "Trust in external curation over algorithm": "#4338ca",
+  "Other": "#6b7280"
+};
+
+function badge(text, color) {
+  return `<span class="badge" style="background:${color}1a; color:${color}; border:1px solid ${color}55;">${text}</span>`;
+}
+
+function sentimentColor(s) {
+  if (s === "negative") return "#dc2626";
+  if (s === "positive") return "#16a34a";
+  return "#6b7280";
+}
+
+async function analyze(text) {
+  const prompt = `You are a research analyst inside a music-streaming Growth team. Analyze this single piece of user feedback about the app's music discovery / recommendations experience.
+
+Feedback: """${text}"""
+
+Return ONLY minified JSON, no markdown, no preamble, with exactly these keys:
+{"theme": one of ["Filter bubble / narrow taste loop","Repetition fatigue","Lack of user control","Poor cross-genre discovery","Positive - new user onboarding","Trust in external curation over algorithm","Other"], "sentiment": one of ["negative","neutral","positive"], "likely_segment": short phrase describing the likely user type (e.g. "long-tenure power listener", "new user", "casual listener"), "root_cause": one concise sentence naming the underlying mechanism causing this, "unmet_need": one concise sentence naming what the user actually wants instead}`;
+
+  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 500,
+      messages: [{ role: "user", content: prompt }]
+    })
+  });
+  const data = await resp.json();
+  const textOut = data.content.filter(b => b.type === "text").map(b => b.text).join("");
+  const cleaned = textOut.replace(/```json|```/g, "").trim();
+  return JSON.parse(cleaned);
+}
+
+function renderResultHTML(r) {
+  return badge(r.theme, THEME_COLORS[r.theme] || "#6b7280")
+    + badge(r.sentiment, sentimentColor(r.sentiment))
+    + badge(r.likely_segment, "#0891b2")
+    + `<div style="margin-top:8px;"><b>Root cause:</b> ${r.root_cause}</div>`
+    + `<div style="margin-top:4px;"><b>Unmet need:</b> ${r.unmet_need}</div>`;
+}
+
+function showError(msg) {
+  const el = document.getElementById("err");
+  el.textContent = msg;
+  el.style.display = "block";
+  setTimeout(() => { el.style.display = "none"; }, 5000);
+}
+
+const cardsEl = document.getElementById("cards");
+SAMPLE_REVIEWS.forEach((r, idx) => {
+  const card = document.createElement("div");
+  card.className = "card";
+  card.innerHTML = `
+    <div class="row">
+      <div style="flex:1;">
+        <div class="src">${r.source}</div>
+        <div class="txt">&ldquo;${r.text}&rdquo;</div>
+      </div>
+      <button class="analyze" data-idx="${idx}">Analyze</button>
+    </div>
+    <div class="result" id="result-${idx}"></div>
+  `;
+  cardsEl.appendChild(card);
+});
+
+cardsEl.addEventListener("click", async (e) => {
+  if (!e.target.classList.contains("analyze")) return;
+  const idx = e.target.getAttribute("data-idx");
+  const btn = e.target;
+  const resultEl = document.getElementById(`result-${idx}`);
+  btn.disabled = true;
+  btn.textContent = "Analyzing…";
+  try {
+    const r = await analyze(SAMPLE_REVIEWS[idx].text);
+    resultEl.innerHTML = renderResultHTML(r);
+    resultEl.classList.add("show");
+    btn.textContent = "Re-analyze";
+  } catch (err) {
+    showError("Analysis failed — please try again.");
+    btn.textContent = "Analyze";
+  }
+  btn.disabled = false;
+});
+
+document.getElementById("customBtn").addEventListener("click", async () => {
+  const text = document.getElementById("customText").value.trim();
+  if (!text) return;
+  const btn = document.getElementById("customBtn");
+  const resultEl = document.getElementById("customResult");
+  btn.disabled = true;
+  btn.textContent = "Analyzing…";
+  try {
+    const r = await analyze(text);
+    resultEl.innerHTML = renderResultHTML(r);
+    resultEl.classList.add("show");
+  } catch (err) {
+    showError("Analysis failed — please try again.");
+  }
+  btn.disabled = false;
+  btn.textContent = "Analyze with Claude";
+});
+</script>
+</body>
+</html>
